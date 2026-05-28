@@ -1,0 +1,34 @@
+{
+  "name": "devswarm",
+  "version": "0.1.0",
+  "description": "Orchestrate a development task across a swarm of Claude Agent SDK agents: plan it, implement subtasks in parallel inside isolated git worktrees, test, review, and integrate — with explicit concurrency, token budget, lifetime cap, isolation, resume, and failure handling.",
+  "type": "module",
+  "bin": {
+    "devswarm": "bin/devswarm.mjs"
+  },
+  "scripts": {
+    "feature": "node bin/devswarm.mjs workflows/implement-feature.mjs",
+    "fix-tests": "node bin/devswarm.mjs workflows/fix-failing-tests.mjs",
+    "codemod": "node bin/devswarm.mjs workflows/codemod.mjs"
+  },
+  "keywords": [
+    "agents",
+    "multi-agent",
+    "orchestration",
+    "claude",
+    "claude-agent-sdk",
+    "coding-agent",
+    "parallel",
+    "worktree",
+    "dev-automation"
+  ],
+  "author": "Sri Harsha Gouru",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.154",
+    "ajv": "^8.17.1"
+  }
+}

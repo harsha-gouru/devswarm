@@ -1,0 +1,14 @@
+node_modules/
+.env
+.env.local
+*.log
+
+# resume journals
+.devswarm/
+
+# worktree isolation scratch (created inside the TARGET repo, but ignore here too)
+.devswarm-worktrees/
+
+.DS_Store
+.vscode/
+.idea/
