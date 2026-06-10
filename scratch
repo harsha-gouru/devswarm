@@ -1,0 +1,415 @@
+Workflow engine on the Claude Agent SDK — multi-agent fan-out (agent/parallel/pipeline/phase/log/budget), RE'd from Claude Code's Workflow tool, with native structured outputs
+README.md
+A Workflow engine on the Claude Agent SDK
+A self-contained, ~180-line reimplementation of the Workflow orchestration engine that ships inside Claude Code — rebuilt on top of the public Claude Agent SDK (@anthropic-ai/claude-agent-sdk) so you can use the same pattern in your own tool / TUI.
+
+What "a workflow" is
+A workflow is a plain-JS script that acts as a deterministic coordinator. It doesn't do the work itself — it spawns subagents, decides what runs concurrently vs sequentially, and threads each subagent's return value into the next step. The script gets six globals injected:
+
+global	what it does
+agent(prompt, opts?)	spawn ONE subagent → returns its result (string, or a validated object if opts.schema). The unit of work.
+parallel(thunks)	barrier fan-out — run all concurrently, await all. Failed agents resolve to null.
+pipeline(items, ...stages)	no-barrier per-item chain — item A can be in stage 3 while B is still in stage 1.
+phase(title)	label the following agents (for progress UI).
+log(msg)	emit a progress line.
+budget	{ total, spent(), remaining() } — output-token accounting for loop guards.
+args	whatever you passed into runWorkflow({ args }).
+This is the same API surface as Claude Code's Workflow tool — see the mapping below.
+
+How it maps to the Agent SDK
+The whole engine is "one agent() = one query()" plus a management shell around it:
+
+agent(prompt, {schema, model, tools})   →   query({ prompt, options })
+                                              drain the async generator to the
+                                              message.type === "result", then return
+                                              result.structured_output (if schema)  or  result (text)
+parallel([...])                          →   Promise.all under a counting semaphore
+pipeline(items, s1, s2)                  →   per-item: s2(await s1(item)), all concurrent
+concurrency cap                          →   min(16, cores - 2)        (same as Claude Code)
+1000-agent lifetime cap                  →   runaway-loop backstop
+budget / budget.remaining()              →   summed result.usage.output_tokens
+schema: {...}                            →   options.outputFormat = { type:'json_schema', schema }
+Each query() is its own isolated session with its own context — exactly what a Workflow subagent is. The subagent gets the SDK's built-in tools (Bash, Read, Write, Grep, WebSearch, …), so the engine never hand-writes a tool loop; it only orchestrates.
+
+Two notes vs. the in-binary Claude Code engine:
+
+Structured output uses the SDK's native outputFormat (Agent SDK v0.3.x+) and reads result.structured_output — no prompt-instructed JSON, no client-side validation needed.
+Resume/journal and git-worktree isolation are omitted here for brevity (they're the same idea: memoize agent() by (prompt, opts); run file-writing agents in a worktree).
+Install & run
+npm i @anthropic-ai/claude-agent-sdk      # v0.3.x+
+# Auth: uses your existing Claude Code login (run `claude` once). No ANTHROPIC_API_KEY needed.
+
+node run.mjs example.workflow.js                       # the bundled code-review example
+node run.mjs example.workflow.js --budget 200000 --concurrency 8
+run.mjs loads a .workflow.js file, runs it, and prints live progress. The example fans out one reviewer per dimension (bugs / security / perf), each returning schema-validated findings, then a synthesizer writes the report.
+
+Writing a workflow
+A workflow file is just a script body — no imports; the globals are injected. It can return a final value, which runWorkflow hands back as result.
+
+phase('Find');
+const SCHEMA = { type:'object', additionalProperties:false,
+  required:['bugs'], properties:{ bugs:{ type:'array', items:{ type:'string' } } } };
+
+// fan out N finders, each with shell+read tools, each forced to return JSON
+const found = await parallel([1,2,3].map((i) => () =>
+  agent(`Pass ${i}: run \`git diff\` and list any bugs.`,
+        { label:`find:${i}`, tools:['Bash','Read','Grep'], schema:SCHEMA, model:'sonnet' })));
+
+const bugs = found.filter(Boolean).flatMap((r) => r.bugs);
+log(`${bugs.length} candidate bugs`);
+
+phase('Verify');
+// pipeline: each bug is verified independently, no barrier between find and verify
+const verdicts = await pipeline(bugs,
+  (bug) => agent(`Is this a real bug? "${bug}". Answer yes/no + why.`, { label:'verify', model:'haiku' }));
+
+return verdicts;
+agent() options
+option	meaning
+schema	JSON Schema → forces structured output; agent() returns the validated object (or null on failure).
+model	'opus' / 'sonnet' / 'haiku' alias, or a full model id. Omit to inherit the SDK default.
+tools	array of allowed tool names (['Bash','Read','Grep',…]). Omit for a no-tool text transform.
+mcpServers	MCP server config passed straight through to the SDK.
+maxTurns	agentic-turn cap (default 40 with tools, 6 without).
+label / phase	progress-UI labels.
+Wiring into a TUI
+runWorkflow takes an onEvent callback — that's your render seam. Every lifecycle event flows through it; map them to your Ink/blessed/whatever view:
+
+import { runWorkflow } from './workflow.mjs';
+
+const rows = new Map();
+const out = await runWorkflow(scriptSource, {
+  args: { task: 'review the branch' },
+  tokenBudget: 500_000,
+  onEvent: (e) => {
+    switch (e.type) {
+      case 'phase':       header(e.title); break;
+      case 'agent:start': rows.set(e.n, { label: e.label, state: 'running' }); render(rows); break;
+      case 'agent:done':  rows.set(e.n, { label: e.label, state: 'done', ms: e.ms }); render(rows); break;
+      case 'agent:error': rows.set(e.n, { label: e.label, state: 'error', err: e.error }); render(rows); break;
+      case 'log':         footer(e.message); break;
+    }
+  },
+});
+// out = { result, agents, spentTokens, costUsd, logs }
+Because the engine is just a function returning a promise, you can run it from a command handler, await it, and stream onEvent straight into your component state. result is whatever the workflow script returned (the synthesized report, the array of verdicts, etc.).
+
+Files
+workflow.mjs — the engine (runWorkflow).
+example.workflow.js — a runnable review-and-synthesize workflow.
+run.mjs — CLI runner + reference onEvent progress printer.
+Caveats
+permissionMode: 'bypassPermissions' runs subagents headless — they execute tools without prompting. Scope tools to what each agent actually needs.
+The script runs in a node:vm sandbox with only the injected globals visible. It is not a security boundary against hostile scripts — it's there to give the script a clean, fixed API.
+Cost is real: each agent() is a billed model call. Use tokenBudget + budget.remaining() to bound loops, and prefer haiku/sonnet for bulk fan-out, opus for synthesis.
+example.workflow.js
+// example.workflow.js — a runnable workflow script for workflow.mjs.
+//
+// Pattern: "review changed files across dimensions, then synthesize" — the canonical
+// fan-out → structured-output → synthesize shape. Run with run.mjs (see README).
+//
+// The globals (agent, parallel, pipeline, phase, log, budget, args) are injected by the
+// engine — you do NOT import anything here. The script can `return` a final value.
+
+const FINDINGS_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['dimension', 'findings'],
+  properties: {
+    dimension: { type: 'string' },
+    findings: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['title', 'severity', 'detail'],
+        properties: {
+          title: { type: 'string' },
+          severity: { type: 'string', enum: ['low', 'medium', 'high'] },
+          detail: { type: 'string' },
+        },
+      },
+    },
+  },
+};
+
+const DIMENSIONS = [
+  { key: 'bugs', prompt: 'Run `git diff` and review the changed code for correctness bugs.' },
+  { key: 'security', prompt: 'Run `git diff` and review the changed code for security issues.' },
+  { key: 'perf', prompt: 'Run `git diff` and review the changed code for performance problems.' },
+];
+
+phase('Review');
+
+// One reviewer per dimension, all concurrent (capped by the semaphore). Each gets read+shell
+// tools and is forced to return JSON matching FINDINGS_SCHEMA.
+const reviews = await parallel(
+  DIMENSIONS.map((d) => () =>
+    agent(`${d.prompt}\nReturn your findings for the "${d.key}" dimension.`, {
+      label: `review:${d.key}`,
+      phase: 'Review',
+      tools: ['Bash', 'Read', 'Grep'],
+      schema: FINDINGS_SCHEMA,
+      model: 'sonnet',
+    }),
+  ),
+);
+
+const all = reviews.filter(Boolean).flatMap((r) => r.findings.map((f) => ({ ...f, dimension: r.dimension })));
+log(`collected ${all.length} findings across ${reviews.filter(Boolean).length} dimensions`);
+
+if (all.length === 0) return { summary: 'No findings.', findings: [] };
+
+phase('Synthesize');
+
+// One synthesizer reads all findings and writes the report. No schema → returns raw markdown.
+const report = await agent(
+  `These are code-review findings (JSON):\n${JSON.stringify(all, null, 2)}\n\n` +
+    'Write a concise markdown review: group by severity, dedupe overlaps, lead with the ' +
+    'highest-impact issues. Output ONLY the markdown.',
+  { label: 'synthesize', phase: 'Synthesize', model: 'opus' },
+);
+
+return { summary: report, findings: all };
+run.mjs
+#!/usr/bin/env node
+// run.mjs — load a .workflow.js file and run it, printing live progress.
+//
+//   node run.mjs example.workflow.js
+//   node run.mjs example.workflow.js --budget 200000 --concurrency 8
+//
+// The onEvent callback below is the seam you replace with your TUI renderer (Ink/blessed/etc.):
+// every agent:start / agent:done / phase / log event flows through it.
+
+import { readFile } from 'node:fs/promises';
+import { runWorkflow } from './workflow.mjs';
+
+const [, , file, ...rest] = process.argv;
+if (!file) {
+  console.error('usage: node run.mjs <file.workflow.js> [--budget N] [--concurrency N]');
+  process.exit(1);
+}
+const flag = (name, d) => {
+  const i = rest.indexOf(name);
+  return i >= 0 ? Number(rest[i + 1]) : d;
+};
+
+const src = await readFile(file, 'utf8');
+
+// ── TUI seam: render however you like. Here we just log to stderr. ────────────────────────
+const onEvent = (e) => {
+  if (e.type === 'phase') console.error(`\n▸ ${e.title}`);
+  else if (e.type === 'agent:start') console.error(`  ⟳ [${e.n}] ${e.label}`);
+  else if (e.type === 'agent:done') console.error(`  ✓ [${e.n}] ${e.label} (${e.ms}ms)`);
+  else if (e.type === 'agent:error') console.error(`  ✗ [${e.n}] ${e.label} — ${e.error}`);
+  else if (e.type === 'log') console.error(`  · ${e.message}`);
+};
+
+const out = await runWorkflow(src, {
+  cwd: process.cwd(),
+  tokenBudget: flag('--budget', null),
+  concurrency: flag('--concurrency', undefined),
+  onEvent,
+});
+
+console.error(`\n— done: ${out.agents} agents, ${out.spentTokens} output tokens, $${out.costUsd.toFixed(4)} —\n`);
+console.log(typeof out.result === 'string' ? out.result : JSON.stringify(out.result, null, 2));
+workflow.mjs
+// workflow.mjs — a self-contained multi-agent Workflow engine on the Claude Agent SDK.
+//
+// This is a distilled, single-file reimplementation of the orchestration engine that ships
+// inside Claude Code (the `Workflow` tool). A "workflow" is a plain-JS *script* that acts as
+// a deterministic coordinator: it spawns subagents with agent(), decides what runs
+// concurrently (parallel) vs streamed per-item (pipeline), and threads each agent's return
+// value into the next step. The engine below is the management shell around that script:
+//
+//   • node:vm sandbox + injected globals   the script can only touch what we inject
+//   • counting semaphore @ min(16, cores-2) caps how many agents run at once
+//   • 1000-agent lifetime backstop          runaway-loop guard
+//   • token budget                          optional hard output-token ceiling for the run
+//
+// Each agent() is ONE `query()` call against the Agent SDK. The subagent gets that runtime's
+// own built-in tools (Bash, Read, Write, Grep, WebSearch, ...) and its own isolated context —
+// so the engine never hand-writes a tool loop; it only orchestrates.
+//
+// Requires: npm i @anthropic-ai/claude-agent-sdk   (v0.3.x+, for native structured outputs)
+// Auth: uses your existing Claude Code login — no ANTHROPIC_API_KEY needed.
+
+import os from 'node:os';
+import vm from 'node:vm';
+import { query } from '@anthropic-ai/claude-agent-sdk';
+
+// Concurrency cap — identical to Claude Code's Workflow engine.
+const CAP_DEFAULT = Math.min(16, Math.max(2, os.cpus().length - 2));
+const AGENT_LIFETIME_CAP = 1000; // runaway-loop backstop, far above any real workflow
+
+// Friendly model aliases → exact IDs (omit to inherit the SDK default).
+const MODELS = {
+  opus: 'claude-opus-4-8',
+  sonnet: 'claude-sonnet-4-6',
+  haiku: 'claude-haiku-4-5',
+};
+
+// Textbook counting semaphore: admits up to `max` concurrent runs, queues the rest.
+function semaphore(max) {
+  let active = 0;
+  const queue = [];
+  return (fn) => async (...args) => {
+    if (active >= max) await new Promise((r) => queue.push(r));
+    active++;
+    try {
+      return await fn(...args);
+    } finally {
+      active--;
+      queue.shift()?.();
+    }
+  };
+}
+
+const slug = (s) =>
+  String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'agent';
+
+/**
+ * Run a workflow script.
+ * @param {string} src   The workflow script (plain JavaScript). Gets agent/parallel/pipeline/
+ *                       phase/log/budget/args injected as globals. May `return` a value.
+ * @param {object} [opts]
+ * @param {any}    [opts.args]         value exposed to the script as the global `args`
+ * @param {string} [opts.cwd]          working dir the subagents operate in
+ * @param {number|null} [opts.tokenBudget]  hard OUTPUT-token ceiling for the whole run (null = unlimited)
+ * @param {number} [opts.concurrency]  max concurrent agents (default min(16, cores-2))
+ * @param {(e:object)=>void} [opts.onEvent]  progress callback — wire this to your TUI
+ * @returns {Promise<{result:any, agents:number, spentTokens:number, costUsd:number, logs:string[]}>}
+ */
+export async function runWorkflow(src, opts = {}) {
+  const {
+    args,
+    cwd = process.cwd(),
+    tokenBudget = null,
+    concurrency = CAP_DEFAULT,
+    onEvent = () => {},
+  } = opts;
+
+  const limit = semaphore(concurrency);
+  let count = 0;          // lifetime agent count
+  let spentTokens = 0;    // summed output tokens (drives budget)
+  let costUsd = 0;        // summed USD
+  let currentPhase = null;
+  const logs = [];
+
+  const checkLimits = () => {
+    if (count >= AGENT_LIFETIME_CAP) {
+      throw new Error(
+        `Agent lifetime cap (${AGENT_LIFETIME_CAP}) reached — almost certainly a runaway loop. ` +
+          'Add a hard iteration cap, or guard budget loops on `budget.total &&`.',
+      );
+    }
+    if (tokenBudget != null && spentTokens >= tokenBudget) {
+      throw new Error(`Token budget exceeded (${spentTokens} / ${tokenBudget} output tokens).`);
+    }
+  };
+
+  // ── the core primitive: one subagent = one query() call ────────────────────────────────
+  const rawAgent = async (prompt, agentOpts = {}) => {
+    checkLimits();
+    const n = ++count;
+    const phase = agentOpts.phase ?? currentPhase ?? 'main';
+    const label = agentOpts.label ?? slug(prompt.slice(0, 48));
+    onEvent({ type: 'agent:start', phase, label, n });
+
+    // Map a friendly alias to an exact model id; pass anything else through verbatim.
+    const model = agentOpts.model
+      ? (Object.hasOwn(MODELS, agentOpts.model) ? MODELS[agentOpts.model] : agentOpts.model)
+      : undefined;
+
+    const systemPrompt = agentOpts.schema
+      ? 'You are a subagent in a workflow. Complete the task using your tools, then emit your ' +
+        'answer via the structured-output schema. Return data, not chatter.'
+      : 'You are a subagent in a workflow. Use your tools to complete the task. Your final ' +
+        'message is returned verbatim to the caller — return the raw answer or data, not chatter.';
+
+    const options = {
+      cwd,
+      systemPrompt,
+      permissionMode: 'bypassPermissions',          // headless: never block on a permission prompt
+      maxTurns: agentOpts.maxTurns ?? (agentOpts.tools ? 40 : 6),
+      ...(model ? { model } : {}),
+      ...(agentOpts.tools ? { allowedTools: agentOpts.tools } : {}),
+      ...(agentOpts.mcpServers ? { mcpServers: agentOpts.mcpServers } : {}),
+      // Native structured output (Agent SDK v0.3.x+): validated JSON in result.structured_output.
+      ...(agentOpts.schema
+        ? { outputFormat: { type: 'json_schema', schema: agentOpts.schema } }
+        : {}),
+    };
+
+    let out = null;
+    let failed = null;
+    const t0 = Date.now();
+    for await (const message of query({ prompt, options })) {
+      if (message?.type === 'result') {
+        spentTokens += message.usage?.output_tokens ?? 0;
+        costUsd += message.total_cost_usd ?? 0;
+        if (message.is_error) { failed = message.subtype; break; }
+        out = agentOpts.schema ? message.structured_output : (message.result ?? '').trim();
+      }
+    }
+
+    if (failed) {
+      onEvent({ type: 'agent:error', phase, label, n, error: failed });
+      return null;                                  // mirror Workflow: a dead agent → null
+    }
+    onEvent({ type: 'agent:done', phase, label, n, ms: Date.now() - t0 });
+    return out;
+  };
+
+  // ── globals injected into the workflow script ──────────────────────────────────────────
+  const agent = limit(rawAgent); // semaphore-wrapped: enforces the concurrency cap
+
+  // parallel(thunks): BARRIER fan-out — awaits all, errors resolve to null.
+  const parallel = (thunks) =>
+    Promise.all(thunks.map((t) => Promise.resolve().then(t).catch(() => null)));
+
+  // pipeline(items, ...stages): NO-barrier per-item chain. Item A can be in stage 3 while item
+  // B is still in stage 1. Each stage gets (prevResult, originalItem, index). A throw drops
+  // that item to null and skips its remaining stages.
+  const pipeline = (items, ...stages) =>
+    Promise.all(
+      items.map(async (item, i) => {
+        let acc = item;
+        for (const stage of stages) {
+          if (acc === null) return null;
+          try { acc = await stage(acc, item, i); }
+          catch { return null; }
+        }
+        return acc;
+      }),
+    );
+
+  const phase = (title) => { currentPhase = title; onEvent({ type: 'phase', title }); };
+  const log = (message) => { logs.push(message); onEvent({ type: 'log', message }); };
+  const budget = {
+    total: tokenBudget,
+    spent: () => spentTokens,
+    remaining: () => (tokenBudget == null ? Infinity : Math.max(0, tokenBudget - spentTokens)),
+  };
+
+  // ── run the script in a vm sandbox with only the injected globals visible ───────────────
+  const sandbox = { agent, parallel, pipeline, phase, log, budget, args, console, JSON, Math, Object, Array, Promise };
+  vm.createContext(sandbox);
+  // Wrap so the script body can use top-level await and `return`.
+  const wrapped = `(async () => {\n${src}\n})()`;
+  const result = await vm.runInContext(wrapped, sandbox, { timeout: 0 });
+
+  return { result, agents: count, spentTokens, costUsd, logs };
+}
+@harsha-gouru
+Comment
+ 
+Leave a comment
+Footer
+© 2026 GitHub, Inc.
+Footer navigation
+Terms
+Privacy
+Security
+Status
